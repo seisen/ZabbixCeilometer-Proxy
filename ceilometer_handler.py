@@ -20,17 +20,18 @@ from threading import Timer
 
 class CeilometerHandler:
 
-    def __init__(self, ceilometer_api_port, polling_interval, template_name, ceilometer_api_host, zabbix_host,
+    def __init__(self, logger, polling_interval, template_name, region, zabbix_url, zabbix_server,
                  zabbix_port, zabbix_proxy_name, keystone_auth):
         """
         TODO
         :type self: object
         """
-        self.ceilometer_api_port = ceilometer_api_port
+	self.logger = logger
+        #self.ceilometer_api_port = ceilometer_api_port
         self.polling_interval = int(polling_interval)
         self.template_name = template_name
-        self.ceilometer_api_host = ceilometer_api_host
-        self.zabbix_host = zabbix_host
+        self.region = region
+        self.zabbix_server = zabbix_server
         self.zabbix_port = zabbix_port
         self.zabbix_proxy_name = zabbix_proxy_name
         self.keystone_auth = keystone_auth
@@ -73,12 +74,31 @@ class CeilometerHandler:
 
                 print "Checking host:" + host[3]
                 #Get links for instance compute metrics
-                request = urllib2.urlopen(urllib2.Request(
-                    "http://" + self.ceilometer_api_host + ":" + self.ceilometer_api_port +
-                    "/v2/resources?q.field=resource_id&q.value=" + host[1],
-                    headers={"Accept": "application/json", "Content-Type": "application/json",
-                             "X-Auth-Token": self.token})).read()
-
+		# get ceilometer host
+		ceilometer_url = None
+		for sc in self.token['serviceCatalog']:
+			for endpoint in sc["endpoints"]:
+				if sc['name'] == 'ceilometer' and endpoint['region'] == self.region:
+					ceilometer_url =  endpoint['publicURL']
+		if ceilometer_url is None:
+			raise Exception('can not find url endpoint name:ceilometer region:s in %s' % \
+				self.region, sc)
+                url = ceilometer_url + "/v2/resources?q.field=resource_id&q.value=" + host[1]
+		try:
+                	request = urllib2.urlopen(urllib2.Request(url,
+			 	headers={
+					"Accept": "application/json", 
+					"Content-Type": "application/json",
+					"X-Auth-Token": self.token['token']['id']})).read()
+        	except urllib2.HTTPError, e:
+	            if e.code == 401:
+        	        raise Exception("url:%s http_code:%s" % (url, e.code))
+	            elif e.code == 404:
+	                raise Exception("url:%s http_code:%s" % (url, e.code))
+	            elif e.code == 503:
+	                raise Exception("url:%s http_code:%s" % (url, e.code))
+	            else:
+	                raise Exception("url:%s http_code:%s" % (url, e.code))
                 # Filter the links to an array
                 for line in json.loads(request):
                     for line2 in line['links']:
@@ -87,12 +107,24 @@ class CeilometerHandler:
                             links.append(line2)
 
                 # Get the links regarding network metrics
-                request = urllib2.urlopen(urllib2.Request(
-                    "http://" + self.ceilometer_api_host + ":" + self.ceilometer_api_port +
-                    "/v2/resources?q.field=metadata.instance_id&q.value=" + host[1],
-                    headers={"Accept": "application/json","Content-Type": "application/json",
-                             "X-Auth-Token": self.token})).read()
-
+                url = ceilometer_url + "/v2/resources?q.field=metadata.instance_id&q.value=" + host[1]
+		try:
+                	request = urllib2.urlopen(urllib2.Request(url,
+                    		headers={
+					"Accept": "application/json",
+					"Content-Type": "application/json",
+                             		"X-Auth-Token": self.token['token']['id']})).read()
+        	except urllib2.HTTPError, e:
+	            if e.code == 401:
+        	        raise Exception("url:%s http_code:%s" % (url, e.code))
+	            elif e.code == 404:
+	                raise Exception("url:%s http_code:%s" % (url, e.code))
+	            elif e.code == 503:
+	                raise Exception("url:%s http_code:%s" % (url, e.code))
+	            else:
+	                self.logger.debug('auth_request: %s' % auth_request)
+	                self.logger.debug('headers: %s' % auth_request.headers)
+	                raise Exception("url:%s http_code:%s" % (url, e.code))
                 # Add more links to the array
                 for line in json.loads(request):
                     for line2 in line['links']:
@@ -117,7 +149,7 @@ class CeilometerHandler:
             contents = urllib2.urlopen(urllib2.Request(link + str("&limit=1"),
                                                        headers={"Accept": "application/json",
                                                                 "Content-Type": "application/json",
-                                                                "X-Auth-Token": self.token})).read()
+                                                                "X-Auth-Token": self.token['token']['id']})).read()
 
         except urllib2.HTTPError, e:
             if e.code == 401:
@@ -146,7 +178,11 @@ class CeilometerHandler:
         :rtype : returns the response received by the Zabbix API
         """
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.connect((self.zabbix_host, int(self.zabbix_port)))
+	try:
+             s.connect((self.zabbix_server, int(self.zabbix_port)))
+	except socket.error, e:
+		self.logger.error("failed to connect zabbix serveur %s:%s" % (self.zabbix_server, self.zabbix_port))
+		raise (e)
         s.send(payload)
         # read its response, the first five bytes are the header again
         response_header = s.recv(5, socket.MSG_WAITALL)

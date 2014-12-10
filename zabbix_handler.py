@@ -15,17 +15,17 @@ __version__ = "1.0"
 
 import urllib2
 import json
-
+import logging
 
 class ZabbixHandler:
-    def __init__(self, keystone_admin_port, compute_port, admin_user, zabbix_admin_pass, zabbix_host, keystone_host,
+    def __init__(self, logger, keystone_admin_port, region, admin_user, zabbix_admin_pass, zabbix_url, keystone_host,
                  template_name, zabbix_proxy_name, keystone_auth):
-
+	self.logger = logger
         self.keystone_admin_port = keystone_admin_port
-        self.compute_port = compute_port
+        self.region = region
         self.zabbix_admin_user = admin_user
         self.zabbix_admin_pass = zabbix_admin_pass
-        self.zabbix_host = zabbix_host
+        self.zabbix_url = zabbix_url
         self.keystone_host = keystone_host
         self.template_name = template_name
         self.zabbix_proxy_name = zabbix_proxy_name
@@ -55,8 +55,13 @@ class ZabbixHandler:
                               "password": self.zabbix_admin_pass},
                    "id": 2}
         response = self.contact_zabbix_server(payload)
-        zabbix_auth = response['result']
-        return zabbix_auth
+	if response.has_key("error"):
+		raise Exception("Zabbix Auth failed with error: %s" % response["error"])
+	elif response.has_key("result"):
+        	zabbix_auth = response['result']
+	        return zabbix_auth
+	else:
+		raise Exception("Zabbix Auth failed with response: %s" % response)
 
     def create_template(self, group_id):
         """
@@ -79,6 +84,7 @@ class ZabbixHandler:
         }
         response = self.contact_zabbix_server(payload)
         template_id = response['result']['templateids'][0]
+	self.logger.info("zabbix template create name:%s group:%s" % (self.template_name, group_id))
         self.create_items(template_id)
         return template_id
 
@@ -98,6 +104,7 @@ class ZabbixHandler:
             else:
                 value_type = 0
             payload = self.define_item(template_id, item, value_type)
+	    self.logger.info("zabbix item create name:%s" % item)
             self.contact_zabbix_server(payload)
 
     def define_item(self, template_id, item, value_type):
@@ -167,6 +174,9 @@ class ZabbixHandler:
                        "id": 1
             }
             response = self.contact_zabbix_server(payload)
+            self.logger.debug("response: %s" % response)
+            if response.has_key('error'):
+                raise Exception('proxy_create failed query: %s with error: %s' % (payload, response['error']))
             proxy_id = response['result']['proxyids'][0]
             return proxy_id
 
@@ -179,11 +189,12 @@ class ZabbixHandler:
         """
         for item in self.group_list:
             tenant_name = item[0]
+            group_name = "amie " + tenant_name
             payload = {
                 "jsonrpc": "2.0",
                 "method": "hostgroup.exists",
                 "params": {
-                    "name": tenant_name
+                    "name": group_name
                 },
                 "auth": self.api_auth,
                 "id": 1
@@ -192,9 +203,10 @@ class ZabbixHandler:
             if response['result'] is False:
                 payload = {"jsonrpc": "2.0",
                            "method": "hostgroup.create",
-                           "params": {"name": tenant_name},
+                           "params": {"name": group_name},
                            "auth": self.api_auth,
                            "id": 2}
+	        self.logger.info("zabbix hostgroup.create name:%s" % group_name)
                 self.contact_zabbix_server(payload)
 
     def check_instances(self):
@@ -209,28 +221,45 @@ class ZabbixHandler:
             if tenant_name == 'admin':
                 tenant_id = item[1]
 
-        auth_request = urllib2.Request(
-            "http://" + self.keystone_host + ":" + self.compute_port + "/v2/" + tenant_id +
-            "/servers/detail?all_tenants=1")
+	nova_url = None
+	for sc in self.token['serviceCatalog']:
+		for endpoint in sc["endpoints"]:
+			# self.logger.debug('name:%s endpoint:%s' % (sc['name'], endpoint))
+			if sc['name'] == 'nova' and endpoint['region'] == self.region:
+				nova_url =  endpoint['publicURL']
+				break
+	if nova_url is None:
+		raise Exception('can not find url endpoint name:nova region:s in %s' % \
+			self.region, sc)
 
-        auth_request.add_header('Content-Type', 'application/json;charset=utf8')
+	url = nova_url + "/servers/detail?all_tenants=1"
+	self.logger.debug("nova_url: %s" % url)
+        auth_request = urllib2.Request(url)
+
+        #auth_request.add_header('Content-Type', 'application/json;charset=utf8')
+        auth_request.add_header('Content-Type', 'application/json')
         auth_request.add_header('Accept', 'application/json')
-        auth_request.add_header('X-Auth-Token', self.token)
+        auth_request.add_header('X-Auth-Token', self.token['token']['id'])
         try:
             auth_response = urllib2.urlopen(auth_request)
             servers = json.loads(auth_response.read())
 
         except urllib2.HTTPError, e:
             if e.code == 401:
-                print '401'
-                print 'Check your keystone credentials\nToken refused!'
+                raise Exception("url:%s http_code:%s" % (url, e.code))
             elif e.code == 404:
-                print 'not found'
+                raise Exception("url:%s http_code:%s" % (url, e.code))
             elif e.code == 503:
-                print 'service unavailable'
+                raise Exception("url:%s http_code:%s" % (url, e.code))
             else:
-                print 'unknown error: '
-
+                self.logger.debug('auth_request: %s' % auth_request)
+                self.logger.debug('headers: %s' % auth_request.headers)
+                raise Exception("url:%s http_code:%s" % (url, e.code))
+	if servers is None:
+		raise Exception("got None servers from keystone")
+		
+	if not servers.has_key("servers"):
+		raise "servers has no key servers : servers=%s" % servers
         for item in servers[u'servers']:
             payload = {
                 "jsonrpc": "2.0",
@@ -260,7 +289,7 @@ class ZabbixHandler:
         :param instance_id:   refers to the instance id
         :param tenant_name:   refers to the tenant name
         """
-        group_id = self.find_group_id(tenant_name)
+        group_id = self.find_group_id("amie " + tenant_name)
 
         if not instance_id in instance_name:
             instance_name = instance_name + '-' + instance_id
@@ -294,6 +323,7 @@ class ZabbixHandler:
                    },
                    "auth": self.api_auth,
                    "id": 1}
+	self.logger.info("zabbix create host:%s id:%s group:%s" % (instance_name, instance_id, group_id))
         self.contact_zabbix_server(payload)
 
     def find_group_id(self, tenant_name):
@@ -436,15 +466,16 @@ class ZabbixHandler:
         auth_request = urllib2.Request('http://' + self.keystone_host + ':'+self.keystone_admin_port+'/v2.0/tenants')
         auth_request.add_header('Content-Type', 'application/json;charset=utf8')
         auth_request.add_header('Accept', 'application/json')
-        auth_request.add_header('X-Auth-Token', self.token)
+        auth_request.add_header('X-Auth-Token', self.token['token']['id'])
 
         try:
             auth_response = urllib2.urlopen(auth_request)
             tenants = json.loads(auth_response.read())
+	    self.logger.debug("auth_response:%s" % auth_response)
         except urllib2.HTTPError, e:
             if e.code == 401:
-                print '401'
-                print 'Check your keystone credentials\nToken refused!'
+		self.logger.error("http_code:401 token refused")
+		raise Exception("http_code:401 token refused")
             elif e.code == 404:
                 print 'not found'
             elif e.code == 503:
@@ -491,7 +522,7 @@ class ZabbixHandler:
         for item in self.group_list:
             if item[1] == tenant_id:
                 tenant_name = item[0]
-                group_id = self.find_group_id(tenant_name)
+                group_id = self.find_group_id("os " + tenant_name)
                 self.delete_host_group(group_id)
                 self.group_list.remove(item)
 
@@ -530,9 +561,15 @@ class ZabbixHandler:
         :return: returns the response from the Zabbix API
         """
         data = json.dumps(payload)
-        req = urllib2.Request('http://'+self.zabbix_host+'/zabbix/api_jsonrpc.php', data,
+	url = self.zabbix_url + '/api_jsonrpc.php'
+        req = urllib2.Request(url, data,
                               {'Content-Type': 'application/json'})
-        f = urllib2.urlopen(req)
-        response = json.loads(f.read())
-        f.close()
-        return response
+	try:
+        	f = urllib2.urlopen(req)
+	        response = json.loads(f.read())
+        	f.close()
+        	return response
+	except urllib2.HTTPError, e:
+		print "url:", url 
+		raise(e)	
+

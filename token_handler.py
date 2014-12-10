@@ -17,8 +17,8 @@ import json
 
 
 class Auth:
-    def __init__(self, auth_host, public_port, admin_tenant, admin_user, admin_password):
-
+    def __init__(self, logger, auth_host, public_port, admin_tenant, admin_user, admin_password):
+	self.logger = logger
         self.auth_host = auth_host
         self.public_port = public_port
         self.admin_tenant = admin_tenant
@@ -39,4 +39,13 @@ class Auth:
         auth_response = urllib2.urlopen(auth_request)
         response_data = json.loads(auth_response.read())
         token = response_data['access']['token']['id']
-        return token
+
+	# self.logger.debug('response_data: %s' % response_data)
+	# self.logger.debug('serviceCatalog: %s' % response_data['access']['serviceCatalog'])
+#	for sc in response_data['access']['serviceCatalog']:
+#		self.logger.debug('serviceCatalog  name:%s region:%s' % (sc['name'], sc['region']))
+#		self.logger.debug('serviceCatalog  name:%s sc=%s' % (sc['name'], sc))
+#		for endpoints in sc["endpoints"]:
+#			self.logger.debug('name:%s region:%s publicURL:%s' % (sc['name'], endpoints['region'], endpoints['publicURL']))
+	return response_data['access']	
+        # return token
